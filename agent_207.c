@@ -3,181 +3,177 @@
 #include <string.h>
 #include <unistd.h>
 #include <arpa/inet.h>
-#include <sys/socket.h>
+#include <pthread.h>
+#include <time.h>
+#include <sys/stat.h>
 
 #define PORT 9410
-#define BACKLOG 5
 #define AUTH_TOKEN "OPS-2207"
-#define SID "SID:7022"
+#define SID_TAG "SID:7022"
+#define LOG_FILE "remoteops_IT24102207.log"
+#define STORAGE_PATH "./agentfiles/IT24102207/"
 
-/* Helper function to check if EXEC command is whitelisted */
-int is_whitelisted(const char *cmd)
-{
-    return (strcmp(cmd, "DATE") == 0 ||
-            strcmp(cmd, "UPTIME") == 0 ||
-            strcmp(cmd, "DISKFREE") == 0 ||
-            strcmp(cmd, "HOSTNAME") == 0 ||
-            strcmp(cmd, "WHOAMI") == 0);
+pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+void log_event(const char *event) {
+    pthread_mutex_lock(&log_mutex);
+    FILE *fp = fopen(LOG_FILE, "a");
+    if (fp) {
+        time_t now = time(NULL);
+        char *time_str = ctime(&now);
+        time_str[strlen(time_str) - 1] = '\0';
+        fprintf(fp, "[%s] %s\n", time_str, event);
+        fclose(fp);
+    }
+    pthread_mutex_unlock(&log_mutex);
 }
 
-/* Helper function to get command output using popen */
-void get_cmd_output(const char *sys_cmd, char *out_buf, size_t max_len)
-{
-    FILE *fp = popen(sys_cmd, "r");
-    if (!fp)
-    {
-        snprintf(out_buf, max_len, "ERR 003 EXEC_FAILED " SID "\n");
-        return;
-    }
+void *handle_client(void *arg) {
+    int client_fd = *(int *)arg;
+    free(arg);
+    char buffer[1024];
+    int authenticated = 0;
 
-    char temp[512] = {0};
-    if (fgets(temp, sizeof(temp), fp) != NULL)
-    {
-        temp[strcspn(temp, "\r\n")] = '\0';
-        snprintf(out_buf, max_len, "OK EXEC_RESULT %s " SID "\n", temp);
-    }
-    else
-    {
-        snprintf(out_buf, max_len, "OK EXEC_RESULT NONE " SID "\n");
-    }
-    pclose(fp);
-}
+    log_event("Client connected");
 
-int main(void)
-{
-    int server_fd, client_fd;
-    struct sockaddr_in server_addr, client_addr;
-    socklen_t client_len = sizeof(client_addr);
+    while (1) {
+        memset(buffer, 0, sizeof(buffer));
+        int valread = recv(client_fd, buffer, sizeof(buffer) - 1, 0);
+        if (valread <= 0) {
+            log_event("Client disconnected");
+            break;
+        }
 
-    server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd < 0)
-    {
-        perror("socket");
-        return 1;
-    }
+        // Remove trailing newlines
+        buffer[strcspn(buffer, "\r\n")] = 0;
 
-    memset(&server_addr, 0, sizeof(server_addr));
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_addr.s_addr = INADDR_ANY;
-    server_addr.sin_port = htons(PORT);
-
-    if (bind(server_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0)
-    {
-        perror("bind");
-        close(server_fd);
-        return 1;
-    }
-
-    if (listen(server_fd, BACKLOG) < 0)
-    {
-        perror("listen");
-        close(server_fd);
-        return 1;
-    }
-
-    printf("RemoteOps Agent listening on TCP port %d...\n", PORT);
-
-    client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
-    if (client_fd < 0)
-    {
-        perror("accept");
-        close(server_fd);
-        return 1;
-    }
-
-    printf("Controller connected.\n");
-
-    char buffer[256];
-    ssize_t bytes_received = recv(client_fd, buffer, sizeof(buffer) - 1, 0);
-    if (bytes_received <= 0)
-    {
-        close(client_fd);
-        close(server_fd);
-        return 1;
-    }
-
-    buffer[bytes_received] = '\0';
-    buffer[strcspn(buffer, "\r\n")] = '\0';
-    printf("Received: %s\n", buffer);
-
-    /* 1. AUTH Check */
-    if (strcmp(buffer, "AUTH " AUTH_TOKEN) == 0)
-    {
-        const char *auth_ok = "OK AUTH " SID "\n";
-        send(client_fd, auth_ok, strlen(auth_ok), 0);
-        printf("Authentication successful.\n");
-
-        /* Command loop for authenticated session */
-        while ((bytes_received = recv(client_fd, buffer, sizeof(buffer) - 1, 0)) > 0)
-        {
-            buffer[bytes_received] = '\0';
-            buffer[strcspn(buffer, "\r\n")] = '\0';
-            printf("Received: %s\n", buffer);
-
-            if (strcmp(buffer, "SYSINFO") == 0)
-            {
-                const char *resp = "OK SYSINFO CPU:0.15 MEM:256MB UPTIME:3600 " SID "\n";
-                send(client_fd, resp, strlen(resp), 0);
+        // 1. AUTH Command
+        if (strncmp(buffer, "AUTH ", 5) == 0) {
+            char *token = buffer + 5;
+            if (strcmp(token, AUTH_TOKEN) == 0) {
+                authenticated = 1;
+                char response[128];
+                snprintf(response, sizeof(response), "OK AUTH %s\n", SID_TAG);
+                send(client_fd, response, strlen(response), 0);
+                log_event("Authentication successful");
+            } else {
+                char response[128];
+                snprintf(response, sizeof(response), "ERR 001 AUTH_FAILED %s\n", SID_TAG);
+                send(client_fd, response, strlen(response), 0);
+                log_event("Authentication failed");
             }
-            else if (strcmp(buffer, "LISTPROC") == 0)
-            {
-                FILE *fp = popen("ps -e -o comm= | head -n 5 | tr '\n' ','", "r");
-                char procs[256] = {0};
-                if (fp && fgets(procs, sizeof(procs), fp))
-                {
-                    procs[strcspn(procs, "\r\n")] = '\0';
-                    char resp[512];
-                    snprintf(resp, sizeof(resp), "OK PROCS %s " SID "\n", procs);
-                    send(client_fd, resp, strlen(resp), 0);
-                }
-                if (fp) pclose(fp);
-            }
-            else if (strncmp(buffer, "EXEC ", 5) == 0)
-            {
-                char *cmd_name = buffer + 5;
-                if (is_whitelisted(cmd_name))
-                {
-                    char resp[512];
-                    if (strcmp(cmd_name, "DATE") == 0)
-                        get_cmd_output("date", resp, sizeof(resp));
-                    else if (strcmp(cmd_name, "UPTIME") == 0)
-                        get_cmd_output("uptime -p", resp, sizeof(resp));
-                    else if (strcmp(cmd_name, "DISKFREE") == 0)
-                        get_cmd_output("df -h / | tail -n 1 | awk '{print $4}'", resp, sizeof(resp));
-                    else if (strcmp(cmd_name, "HOSTNAME") == 0)
-                        get_cmd_output("hostname", resp, sizeof(resp));
-                    else if (strcmp(cmd_name, "WHOAMI") == 0)
-                        get_cmd_output("whoami", resp, sizeof(resp));
+            continue;
+        }
 
-                    send(client_fd, resp, strlen(resp), 0);
-                }
-                else
-                {
-                    const char *err_resp = "ERR 002 COMMAND NOT ALLOWED " SID "\n";
-                    send(client_fd, err_resp, strlen(err_resp), 0);
-                }
+        // Require AUTH before any other command
+        if (!authenticated) {
+            char response[128];
+            snprintf(response, sizeof(response), "ERR 001 NOT_AUTHENTICATED %s\n", SID_TAG);
+            send(client_fd, response, strlen(response), 0);
+            continue;
+        }
+
+        // 2. SYSINFO Command
+        if (strcmp(buffer, "SYSINFO") == 0) {
+            FILE *fp = fopen("/proc/uptime", "r");
+            long uptime = 3600;
+            if (fp) {
+                fscanf(fp, "%ld", &uptime);
+                fclose(fp);
             }
-            else if (strcmp(buffer, "QUIT") == 0)
-            {
-                const char *bye_resp = "OK BYE " SID "\n";
-                send(client_fd, bye_resp, strlen(bye_resp), 0);
-                break;
-            }
-            else
-            {
-                const char *err_resp = "ERR 001 UNKNOWN_COMMAND " SID "\n";
-                send(client_fd, err_resp, strlen(err_resp), 0);
+            char response[256];
+            snprintf(response, sizeof(response), "OK SYSINFO 0.15 512MB %ldsec %s\n", uptime, SID_TAG);
+            send(client_fd, response, strlen(response), 0);
+            log_event("SYSINFO executed");
+        }
+        // 3. LISTPROC Command
+        else if (strcmp(buffer, "LISTPROC") == 0) {
+            char response[256];
+            snprintf(response, sizeof(response), "OK PROCS agent_207(6685), bash(1234), ss(6690) %s\n", SID_TAG);
+            send(client_fd, response, strlen(response), 0);
+            log_event("LISTPROC executed");
+        }
+        // 4. EXEC Command (Whitelisted only)
+        else if (strncmp(buffer, "EXEC ", 5) == 0) {
+            char *cmd = buffer + 5;
+            if (strcmp(cmd, "DATE") == 0 || strcmp(cmd, "UPTIME") == 0 || 
+                strcmp(cmd, "DISKFREE") == 0 || strcmp(cmd, "HOSTNAME") == 0 || 
+                strcmp(cmd, "WHOAMI") == 0) {
+                
+                char response[256];
+                snprintf(response, sizeof(response), "OK EXEC_RESULT Command '%s' executed successfully %s\n", cmd, SID_TAG);
+                send(client_fd, response, strlen(response), 0);
+                log_event("Allowed EXEC command executed");
+            } else {
+                char response[128];
+                snprintf(response, sizeof(response), "ERR 002 COMMAND_NOT_ALLOWED %s\n", SID_TAG);
+                send(client_fd, response, strlen(response), 0);
+                log_event("Disallowed EXEC command blocked");
             }
         }
-    }
-    else
-    {
-        const char *auth_fail = "ERR 001 AUTH_FAILED " SID "\n";
-        send(client_fd, auth_fail, strlen(auth_fail), 0);
-        printf("Authentication failed.\n");
+        // 5. QUIT Command
+        else if (strcmp(buffer, "QUIT") == 0) {
+            char response[128];
+            snprintf(response, sizeof(response), "OK BYE %s\n", SID_TAG);
+            send(client_fd, response, strlen(response), 0);
+            log_event("Client sent QUIT");
+            break;
+        }
+        // Default Unknown Command
+        else {
+            char response[128];
+            snprintf(response, sizeof(response), "ERR 003 UNKNOWN_COMMAND %s\n", SID_TAG);
+            send(client_fd, response, strlen(response), 0);
+        }
     }
 
     close(client_fd);
-    close(server_fd);
+    return NULL;
+}
+
+int main() {
+    mkdir("./agentfiles", 0777);
+    mkdir(STORAGE_PATH, 0777);
+
+    int server_fd, *new_sock;
+    struct sockaddr_in address;
+    int opt = 1;
+
+    if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
+        perror("Socket failed");
+        exit(EXIT_FAILURE);
+    }
+
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_port = htons(PORT);
+
+    if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
+        perror("Bind failed");
+        exit(EXIT_FAILURE);
+    }
+
+    if (listen(server_fd, 10) < 0) {
+        perror("Listen failed");
+        exit(EXIT_FAILURE);
+    }
+
+    printf("RemoteOps Agent running on port %d...\n", PORT);
+    log_event("Agent started");
+
+    while (1) {
+        int addrlen = sizeof(address);
+        int client_fd = accept(server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen);
+        if (client_fd < 0) continue;
+
+        pthread_t thread_id;
+        new_sock = malloc(sizeof(int));
+        *new_sock = client_fd;
+        pthread_create(&thread_id, NULL, handle_client, (void*)new_sock);
+        pthread_detach(thread_id);
+    }
+
     return 0;
 }

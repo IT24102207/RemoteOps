@@ -3,69 +3,62 @@
 #include <string.h>
 #include <unistd.h>
 #include <arpa/inet.h>
-#include <sys/socket.h>
 
-#define PORT 9410
-#define SERVER_IP "192.168.179.128"
-
-void send_cmd(int sock_fd, const char *cmd)
-{
-    char buffer[1024];
-    send(sock_fd, cmd, strlen(cmd), 0);
-    printf("Sent: %s", cmd);
-
-    ssize_t bytes = recv(sock_fd, buffer, sizeof(buffer) - 1, 0);
-    if (bytes > 0)
-    {
-        buffer[bytes] = '\0';
-        printf("Agent response: %s", buffer);
-    }
-}
-
-int main(void)
-{
-    int sock_fd;
-    struct sockaddr_in server_addr;
-
-    sock_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock_fd < 0)
-    {
-        perror("socket");
+int main(int argc, char *argv[]) {
+    if (argc < 3) {
+        printf("Usage: %s <IP> <PORT>\n", argv[0]);
         return 1;
     }
 
-    memset(&server_addr, 0, sizeof(server_addr));
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(PORT);
-    inet_pton(AF_INET, SERVER_IP, &server_addr.sin_addr);
+    int sock = 0;
+    struct sockaddr_in serv_addr;
 
-    if (connect(sock_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0)
-    {
-        perror("connect");
-        close(sock_fd);
-        return 1;
+    if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+        printf("Socket creation error\n");
+        return -1;
+    }
+
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_port = htons(atoi(argv[2]));
+
+    if (inet_pton(AF_INET, argv[1], &serv_addr.sin_addr) <= 0) {
+        printf("Invalid address/ Address not supported\n");
+        return -1;
+    }
+
+    if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
+        printf("connect: Connection refused\n");
+        return -1;
     }
 
     printf("Connected to RemoteOps Agent.\n");
 
-    /* 1. AUTH */
-    send_cmd(sock_fd, "AUTH OPS-2207\n");
+    char command[256];
+    char buffer[1024];
 
-    /* 2. SYSINFO */
-    send_cmd(sock_fd, "SYSINFO\n");
+    while (1) {
+        memset(command, 0, sizeof(command));
+        if (fgets(command, sizeof(command), stdin) == NULL) break;
 
-    /* 3. LISTPROC */
-    send_cmd(sock_fd, "LISTPROC\n");
+        command[strcspn(command, "\r\n")] = 0;
+        if (strlen(command) == 0) continue;
 
-    /* 4. Whitelisted EXEC (Allowed) */
-    send_cmd(sock_fd, "EXEC DATE\n");
+        char send_buf[280];
+        snprintf(send_buf, sizeof(send_buf), "%s\n", command);
+        send(sock, send_buf, strlen(send_buf), 0);
 
-    /* 5. Whitelisted EXEC (Disallowed - Testing Error Case) */
-    send_cmd(sock_fd, "EXEC RM\n");
+        memset(buffer, 0, sizeof(buffer));
+        int valread = recv(sock, buffer, sizeof(buffer) - 1, 0);
+        if (valread > 0) {
+            printf("Agent response: %s", buffer);
+        } else {
+            printf("Connection closed by agent.\n");
+            break;
+        }
 
-    /* 6. QUIT */
-    send_cmd(sock_fd, "QUIT\n");
+        if (strcmp(command, "QUIT") == 0) break;
+    }
 
-    close(sock_fd);
+    close(sock);
     return 0;
 }
