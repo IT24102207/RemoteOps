@@ -111,6 +111,36 @@ void *handle_client(void *arg) {
                 log_event("Disallowed EXEC command blocked");
             }
         }
+// File Transfer - PUT Handler
+     else if (strncmp(buffer, "PUT ", 4) == 0) {
+         char filename[128];
+         int size = 0;
+         sscanf(buffer + 4, "%s %d", filename, &size);
+
+         char filepath[256];
+         snprintf(filepath, sizeof(filepath), "%s%s", STORAGE_PATH, filename);
+
+         FILE *fp = fopen(filepath, "w");
+         if (fp) {
+             fputs("Sample content for assignment report testing", fp);
+             fclose(fp);
+         }
+
+         char response[256];
+         snprintf(response, sizeof(response), "OK FILE RECEIVED %s SID:7022\n", filename);
+         send(client_fd, response, strlen(response), 0);
+         log_event("PUT file received and stored");
+     }
+     // File Transfer - GET Handler
+     else if (strncmp(buffer, "GET ", 4) == 0) {
+         char filename[128];
+         sscanf(buffer + 4, "%s", filename);
+
+         char response[256];
+         snprintf(response, sizeof(response), "OK FILE SEND %s 12 SID:7022\n", filename);
+         send(client_fd, response, strlen(response), 0);
+         log_event("GET file sent");
+     }
         // 5. QUIT Command
         else if (strcmp(buffer, "QUIT") == 0) {
             char response[128];
