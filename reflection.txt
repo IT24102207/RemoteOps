@@ -1,0 +1,2 @@
+Reflection:
+During this RemoteOps assignment, I learned how to implement socket programming in C, handle client-server communication, and utilize Makefiles for automation. Troubleshooting network configurations and Git version control improved my practical system administration skills.
